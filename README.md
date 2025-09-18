@@ -3,7 +3,13 @@
 **Base URL:** `https://approvals.isanapps.com`
 
 This guide documents a full happy‑path flow:
-1) Register a new end user → 2) Log in and fetch profile → 3) Admin logs in → 4) Discover available permissions → 5) Create a role with selected permissions → 6) Assign role to the user → 7) Verify allowed and forbidden access for the user.
+1) Register a new end user → 
+2) Log in and fetch profile → 
+3) Admin logs in → 
+4) Discover available permissions → 
+5) Create a role with selected permissions → 
+6) Assign role to the user → 
+7) Verify allowed and forbidden access for the user.
 
 > **Auth model**: Endpoints expect **JWT access tokens** in the `Authorization: Bearer <ACCESS_TOKEN>` header. The API also returns a `refresh` token, but this guide uses the **access** token for requests.
 
