@@ -1,444 +1,442 @@
-# Authentication Service — Technical Documentation (openAPI Bridge, Company‑Based Auth)
+# Approvals IAM — End‑to‑End Roles & Permissions Walkthrough
 
-> **Context:** This Authentication Service secures the **openAPI Integration Bridge** for external companies integrating with FlyAkeedCorp systems. It implements **company‑based authentication** (no end‑users) and **server‑to‑server** token issuance with **no refresh tokens**, per business rules. Where a conventional refresh flow is mentioned, it is explicitly **disabled** for this openAPI context and documented for completeness.
+**Base URL:** `https://approvals.isanapps.com`
 
----
+This guide documents a full happy‑path flow:
+1) Register a new end user → 2) Log in and fetch profile → 3) Admin logs in → 4) Discover available permissions → 5) Create a role with selected permissions → 6) Assign role to the user → 7) Verify allowed and forbidden access for the user.
 
-## 1) Module Overview
-
-**Purpose:** Provide secure, company‑scoped authentication and authorization for partner integrations via the openAPI Bridge.
-
-**Core responsibilities:**
-- Validate **company credentials** (company email + password with domain restriction).
-- Issue short‑lived **access tokens (JWT)**; **no refresh tokens** for S2S.
-- Enforce **subscription limits** (token count, expiry) and **role‑based endpoint permissions**.
-- Support **token lifecycle** actions (issue, list, revoke/blacklist, delete) via company self‑service and back‑office.
-- Provide **middleware** to gate every protected endpoint by token validity, subscription status, email status, and permissions.
-
-**Design defaults:**
-- **JWT algorithm:** RS256 (asymmetric). Private key server‑side; public key distributed to verifiers.
-- **Access token TTL:** Configurable (e.g., 60 minutes). Effective validity = `min(token.expires_at, subscription.end_date)`.
-- **Clock skew tolerance:** ±60s.
-- **Token audience (aud):** `openapi.flyakeedcorp`.
-- **Issuer (iss):** `auth.openapi.flyakeedcorp`.
+> **Auth model**: Endpoints expect **JWT access tokens** in the `Authorization: Bearer <ACCESS_TOKEN>` header. The API also returns a `refresh` token, but this guide uses the **access** token for requests.
 
 ---
 
-## 2) Module Interactions
+## Quick variables (recommended)
 
-**Inbound callers**
-- **External Partner Clients** (server‑to‑server) — use company credentials to obtain tokens; call protected business APIs via openAPI.
-- **Backoffice UI / Admin API** — manage companies, subscriptions, emails, and tokens.
+For cURL ergonomics, you can export environment vars in your terminal:
 
-**Downstream dependencies**
-- **User/Company Directory** — persistent store for `COMPANY` and `COMPANY_EMAIL`.
-- **Subscription Service** — defines plan, token limits, and expiry.
-- **Protected Business Modules** (Flights, Employees, Companies, Hotels, etc.) — validate access JWT on each request.
-
-**Relationship / dependencies**
-- All **protected endpoints** require a **valid access token** and **permission** for the specific route.
-- Token acceptance requires: signature valid, not expired, not revoked, email active, company subscription active, and role‑permission allows the route.
-
----
-
-## 3) Data Model
-
-### Entities
-- **COMPANY** — integration tenant; owns domain, subscription(s), and tokens.
-- **COMPANY_EMAIL** — company account emails; must match company domain; may be individually activated/revoked.
-- **SUBSCRIPTION** — plan, token limit, effective dates, role.
-- **TOKEN** — issued JWT metadata (revocation state, expiry, device metadata, associated company + email).
-
-### ERD (Mermaid)
-```mermaid
-erDiagram
-    COMPANY ||--o{ COMPANY_EMAIL : has
-    COMPANY ||--o{ TOKEN : issues
-    COMPANY ||--o{ SUBSCRIPTION : subscribes
-
-    COMPANY {
-        string id PK
-        string name
-        string domain
-    }
-
-    COMPANY_EMAIL {
-        string id PK
-        string email
-        boolean active
-        string company_id FK
-    }
-
-    SUBSCRIPTION {
-        string id PK
-        string company_id FK
-        datetime start_date
-        datetime end_date
-        int token_limit
-        string role
-        boolean active
-    }
-
-    TOKEN {
-        string id PK
-        string company_id FK
-        string company_email_id FK
-        datetime issued_at
-        datetime expires_at
-        string device_metadata
-        boolean revoked
-    }
+```bash
+export BASE_URL="https://approvals.isanapps.com"
+# After each login, set:
+export ACCESS_TOKEN="<PASTE_ACCESS_TOKEN_HERE>"
 ```
 
-### Token (JWT) claims (example)
+Then use them like:
+
+```bash
+curl --location "$BASE_URL/api/anything" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+---
+
+## 1) Register a new user
+**Endpoint:** `POST /api/user/auth/register/`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/user/auth/register/" \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data '
+{
+  "email": "test@test.com",
+  "firstName": "John",
+  "lastName": "Doe",
+  "title": "Mr.",
+  "address": "123 Main St",
+  "telephone1": "555-123-4567",
+  "changePassNxtLog": null,
+  "lastLoginDate": "2024-12-28T12:00:00Z",
+  "firstLoginDate": "2024-11-28T12:00:00Z",
+  "is_active": true,
+  "is_admin": false,
+  "password":"123123",
+  "password2":"123123"
+}'
+```
+
+**Response (example)**
 ```json
 {
-  "iss": "auth.openapi.flyakeedcorp",
-  "aud": "openapi.flyakeedcorp",
-  "sub": "token:1f7c2c...",             // TOKEN.id
-  "cid": "comp_2a91...",                // COMPANY.id
-  "email": "api1@companya.com",         // COMPANY_EMAIL.email
-  "role": "partner_admin",              // from SUBSCRIPTION.role or explicit RBAC assignment
-  "perms": ["flights.read", "employees.read"],
-  "iat": 1737030000,
-  "exp": 1737033600,                     // <= subscription.end_date
-  "device": {
-    "name": "build-server-01",
-    "ip": "203.0.113.42",
-    "agent": "curl/8.4"
-  }
+  "token": {
+    "refresh": "<REFRESH_TOKEN>",
+    "access": "<ACCESS_TOKEN>"
+  },
+  "msg": "Registration Success"
+}
+```
+
+> **Note:** Copy the `access` token to `$ACCESS_TOKEN` if you want to immediately call authenticated endpoints.
+
+---
+
+## 2) Log in with the new user
+**Endpoint:** `POST /api/user/auth/login/`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/user/auth/login/" \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+    "email":"test@test.com",
+    "password":"123123"
+}'
+```
+
+**Response (example)**
+```json
+{
+  "token": {
+    "refresh": "<REFRESH_TOKEN>",
+    "access": "<ACCESS_TOKEN>"
+  },
+  "msg": "Login Success"
+}
+```
+
+Set the access token for subsequent calls:
+```bash
+export ACCESS_TOKEN="<ACCESS_TOKEN_FROM_RESPONSE>"
+```
+
+---
+
+## 3) Get the user profile
+**Endpoint:** `GET /api/user/auth/profile`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/user/auth/profile" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Response (example)**
+```json
+{
+  "id": 5,
+  "email": "test@test.com",
+  "firstName": "John",
+  "lastName": "Doe",
+  "title": "Mr.",
+  "address": "123 Main St",
+  "is_admin": false,
+  "telephone1": "555-123-4567"
+}
+```
+
+> We will use `id = 5` later when assigning roles.
+
+---
+
+## 4) Admin logs in
+**Endpoint:** `POST /api/user/auth/login/`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/user/auth/login/" \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+    "email":"a.mahmoud@transtecbds.com",
+    "password":"Trans@321"
+}'
+```
+
+**Response (example)**
+```json
+{
+  "token": {
+    "refresh": "<REFRESH_TOKEN>",
+    "access": "<ADMIN_ACCESS_TOKEN>"
+  },
+  "msg": "Login Success"
+}
+```
+
+Set admin token:
+```bash
+export ACCESS_TOKEN="<ADMIN_ACCESS_TOKEN>"
+```
+
+---
+
+## 5) Discover permission URL patterns (admin)
+**Endpoint:** `GET /api/iam/permission/urls/tree`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/iam/permission/urls/tree?page_size=2&page=1&ordering=-id" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Response (excerpt)**
+```json
+{
+  "data": [
+    {"url_pattern": "/api/user/auth/register/", "name": "register"},
+    {"url_pattern": "/api/user/auth/login/", "name": "login"},
+    {"url_pattern": "/api/user/auth/profile/", "name": "profile"},
+    {"url_pattern": "/api/user/users/list", "name": "list-users"},
+    {"url_pattern": "/api/business/list", "name": "list-business-partner"},
+    {"url_pattern": "/api/iam/role/list", "name": "role.list"},
+    ...
+  ]
+}
+```
+
+> Choose the `url_pattern` values you want to include in a role.
+
+---
+
+## 6) Create a role with selected permissions (admin)
+**Endpoint:** `POST /api/iam/role/create`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/iam/role/create" \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --header "Authorization: Bearer $ACCESS_TOKEN" \
+  --data '
+{
+  "name":"role for test user ",
+  "permissions": [
+    {
+      "name":"list all the business",
+      "url_pattern":"/api/business/list"
+    },
+    {
+      "name":"list all the roles",
+      "url_pattern":"/api/iam/role/list"
+    }
+  ]
+}'
+```
+
+**Response**: `201 Created` with role payload (implementation‑dependent).
+
+---
+
+## 7) List roles to find the created role id (admin)
+**Endpoint:** `GET /api/iam/role/list`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/iam/role/list?select=name%2Cid&filter=&page_size=2&page=1&ordering=-id" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Response (example)**
+```json
+{
+  "count": 8,
+  "next": "http://localhost:8000/api/iam/role/list?filter=&ordering=-id&page=2&page_size=2&select=name%2Cid",
+  "previous": null,
+  "results": [
+    { "id": 13, "name": "role for test user "},
+    { "id": 12, "name": "BP102"}
+  ],
+  "total_pages": 4
+}
+```
+
+> In this example, the new role id is **13**.
+
+---
+
+## 8) Assign the role to the user (admin)
+**Endpoint:** `POST /api/iam/role/user/add/<user-id>`
+
+**Path params:** `user-id = 5` (from profile)
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/iam/role/user/add/5" \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --header "Authorization: Bearer $ACCESS_TOKEN" \
+  --data '{
+    "role_ids":[13]
+}'
+```
+
+**Response (example)**
+```json
+{
+  "message": "Roles added to user 'John'.",
+  "added_roles": [
+    "role for test user "
+  ]
 }
 ```
 
 ---
 
-## 4) Authorization Model
+## 9) Verify access with the test user
 
-**Roles & Permissions**
-- Each subscription (or company assignment) provides a **role** with an associated **permission matrix**.
-- Permissions map to **endpoint scopes**, e.g., `flights.read`, `employees.write`.
-- Middleware enforces **endpoint → required permissions**.
+### 9.1) Log in again as the test user
+**Endpoint:** `POST /api/user/auth/login/`
 
-**Isolation**
-- Every token is **company‑scoped**. Cross‑company data access is forbidden by design.
-
----
-
-## 5) Middleware Flow
-
-```mermaid
-flowchart TD
-    A[Incoming API Request] --> B[Extract Token]
-    B --> C[Validate Token Signature & Expiry]
-    C --> D{Company Subscription Active?}
-    D -- No --> Z[Reject: Subscription Expired/Inactive]
-    D -- Yes --> E{Token Revoked or Blacklisted?}
-    E -- Yes --> Z[Reject: Token Revoked]
-    E -- No --> F{Company Email Active?}
-    F -- No --> Z[Reject: Email Revoked/Deleted]
-    F -- Yes --> G{Role Has Permission for Endpoint?}
-    G -- No --> Z[Reject: Forbidden]
-    G -- Yes --> H[Grant Access to Endpoint]
+**Request**
+```bash
+curl --location "$BASE_URL/api/user/auth/login/" \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+    "email":"test@test.com",
+    "password":"123123"
+}'
 ```
 
----
-
-## 6) API Endpoints
-
-> **Base URL**: `/auth/*` (versioned under `/v1/auth/*` when applicable)
-
-### Summary Table
-
-| Method | Path                 | Auth            | Purpose |
-|-------:|----------------------|-----------------|---------|
-| POST   | `/auth/login`        | Basic (email+pw)| Issue new access token (no refresh token). |
-| POST   | `/auth/token`        | Basic (email+pw)| Issue **additional** token (same as login; explicit action). |
-| GET    | `/auth/tokens`       | Bearer (JWT)    | List active tokens for company/email. |
-| POST   | `/auth/token/revoke` | Bearer (JWT)    | Revoke a token by ID (self‑service). |
-| POST   | `/auth/refresh`      | **Disabled**    | Conventional refresh flow — **returns 405** in openAPI S2S mode. |
-
-> Backoffice/Admin endpoints live under `/admin/*` (e.g., `/admin/tokens`, `/admin/tokens/:id/revoke`).
-
----
-
-### 6.1 POST `/auth/login` — Issue Access Token (No Refresh)
-
-**Purpose / Logic**
-- Authenticate **company email + password**.
-- Verify email belongs to company domain and is **active**.
-- Verify **subscription active** and **token_limit** not exceeded.
-- Issue JWT access token; persist `TOKEN` row with device metadata and `expires_at` = `min(now + token_ttl, subscription.end_date)`.
-
-**Input**
+**Response (example)**
 ```json
 {
-  "email": "api1@companya.com",
-  "password": "string",
-  "device": {
-    "name": "build-server-01",
-    "ip": "203.0.113.42",
-    "agent": "curl/8.4"
-  }
+  "token": {
+    "refresh": "<REFRESH_TOKEN>",
+    "access": "<ACCESS_TOKEN>"
+  },
+  "msg": "Login Success"
 }
 ```
 
-**Validation**
-- `email` required, RFC5322, domain must equal `COMPANY.domain`.
-- `password` required, min 8 chars (configurable), rate‑limited.
-- `device.name` optional ≤ 120 chars; `device.ip` optional IPv4/IPv6; `agent` optional ≤ 200 chars.
+Set the user token:
+```bash
+export ACCESS_TOKEN="<ACCESS_TOKEN_FROM_RESPONSE>"
+```
 
-**Responses**
-- `201 Created`
+### 9.2) Call an **allowed** endpoint (`/api/business/list`)
+**Endpoint:** `GET /api/business/list`
+
+**Request**
+```bash
+curl --location "$BASE_URL/api/business/list" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Response (example)**
 ```json
 {
-  "msg": "Access token issued.",
-  "data": {
-    "token": {
-      "id": "tok_1f7c2c...",
-      "access_token": "<JWT>",
-      "token_type": "Bearer",
-      "expires_at": "2025-09-16T18:50:00Z"
+  "count": 1,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": 1,
+      "name": "Acme Corporation",
+      "Email": "contact@acme.com",
+      "WebSite": "https://www.acme.com",
+      "MobilePhone": "+1234567890",
+      "VatLiable": true,
+      "VatRegNo": "VAT123456789",
+      "RegCommNo": "REG123456789",
+      "Address": "123 Main St, Anytown, USA",
+      "Country": "USA",
+      "State": "California",
+      "ZipCode": "12345",
+      "City": "Anytown",
+      "ERPCode": "ACME-ERP-001",
+      "Status": "Active",
+      "Attachment": 1
     }
-  }
+  ],
+  "total_pages": 1
 }
 ```
 
-**Errors**
-- `400` invalid_input (validation failure)
-- `401` invalid_credentials (wrong email/password)
-- `403` email_inactive | subscription_inactive | token_limit_reached
-- `429` too_many_attempts
+### 9.3) Call a **forbidden** endpoint (not in role)
+**Endpoint:** `GET /api/iam/permission/list`
 
----
-
-### 6.2 POST `/auth/token` — Issue Additional Token
-
-**Purpose / Logic**
-- Same semantics as **login**, but intended for explicit additional issuance (e.g., different device metadata). Enforces subscription token limits.
-
-**Input / Validation / Responses / Errors**
-- **Same** as `/auth/login`.
-
----
-
-### 6.3 GET `/auth/tokens` — List Tokens (Company/Email Scope)
-
-**Purpose / Logic**
-- Return paginated tokens for the authenticated company; optionally filter by email.
-
-**Auth**: Bearer access token (must include `cid`).
-
-**Query Params**
-- `email` (optional) — filter by `COMPANY_EMAIL.email`.
-- `status` (optional) — `active|revoked|expired`.
-- `page` (default 1), `page_size` (default 20, max 100).
-
-**Response**
-```json
-{
-  "data": {
-    "items": [
-      {
-        "id": "tok_1f7c2c...",
-        "email": "api1@companya.com",
-        "issued_at": "2025-09-16T17:50:00Z",
-        "expires_at": "2025-09-16T18:50:00Z",
-        "revoked": false,
-        "device_metadata": { "name": "build-server-01" }
-      }
-    ],
-    "page": 1,
-    "page_size": 20,
-    "total": 3
-  }
-}
+**Request**
+```bash
+curl --location "$BASE_URL/api/iam/permission/list?page_size=2&page=1&ordering=-id" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
-**Errors**
-- `401` invalid_token | token_expired
-- `403` forbidden (missing perms like `tokens.read`)
+**Response (example)**
+```
+status: 403 Forbidden
+
+You do not have permission to access this URL.
+```
+
+> ✅ At this point, role‑based authorization is functioning as expected.
 
 ---
 
-### 6.4 POST `/auth/token/revoke` — Revoke a Token
+## Mermaid — End‑to‑End Flow (Happy Path)
 
-**Purpose / Logic**
-- Revoke a specific token (self‑service). A revoked token becomes invalid immediately.
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User (test@test.com)
+  participant A as Admin
+  participant API as Approvals API
 
-**Auth**: Bearer access token with permission `tokens.revoke`.
+  U->>API: POST /api/user/auth/register
+  API-->>U: 200 + tokens (access, refresh)
 
-**Input**
-```json
-{ "token_id": "tok_1f7c2c..." }
-```
+  U->>API: POST /api/user/auth/login
+  API-->>U: 200 + tokens
 
-**Response**
-```json
-{ "msg": "Token revoked.", "data": { "token_id": "tok_1f7c2c..." } }
-```
+  U->>API: GET /api/user/auth/profile (Bearer access)
+  API-->>U: 200 { id:5, ... }
 
-**Errors**
-- `400` invalid_input
-- `401` invalid_token | token_expired
-- `403` forbidden (not same company)
-- `404` token_not_found
+  A->>API: POST /api/user/auth/login
+  API-->>A: 200 + admin tokens
 
----
+  A->>API: GET /api/iam/permission/urls/tree (Bearer admin)
+  API-->>A: 200 list of url_pattern
 
-### 6.5 POST `/auth/refresh` — **Disabled in S2S Mode**
+  A->>API: POST /api/iam/role/create (payload with selected url_pattern)
+  API-->>A: 201 role { id:13 }
 
-**Purpose / Logic**
-- Conventional user‑based flows would exchange a refresh token for a new access token. **For openAPI S2S, this endpoint is disabled**.
+  A->>API: POST /api/iam/role/user/add/5 { role_ids:[13] }
+  API-->>A: 200 roles added
 
-**Response**
-- `405 Method Not Allowed`
-```json
-{ "error": { "code": "refresh_disabled", "message": "Refresh tokens are disabled for server-to-server integrations." } }
+  U->>API: POST /api/user/auth/login (get new user tokens)
+  API-->>U: 200 + tokens
+
+  U->>API: GET /api/business/list (Bearer user)
+  API-->>U: 200 results
+
+  U->>API: GET /api/iam/permission/list
+  API-->>U: 403 Forbidden
 ```
 
 ---
 
-## 7) Error Handling — Standard Schema
+## Troubleshooting & Notes
+
+- **401 Unauthorized**: Ensure `Authorization: Bearer <ACCESS_TOKEN>` is present and not expired. Always use the **access** token, not the refresh token, in headers.
+- **403 Forbidden**: The token is valid, but the role assigned to the user does not include the endpoint’s `url_pattern` permission.
+- **URL patterns with parameters**: The permission tree may contain parameterized patterns (e.g., `/api/user/admin/update/<int:pk>` and wildcard forms like `/api/user/admin/update/*`). Confirm which pattern your role should include.
+- **Pagination & filters**: Many list endpoints support `page`, `page_size`, `ordering`, and `filter`. Adjust as needed.
+- **Token rotation**: If access tokens are short‑lived, re‑login to obtain a fresh one or use your refresh flow if supported by your deployment.
+
+---
+
+## Appendix — Minimal Postman Collection (optional)
+
+> Import this JSON into Postman and set a collection variable `base_url` to `https://approvals.isanapps.com`. Use the login responses to paste `access` tokens in the **Authorization** header (Bearer).
 
 ```json
 {
-  "error": {
-    "code": "string",
-    "message": "human readable",
-    "details": { "field": "explanation" }
-  }
+  "info": {"name": "Approvals IAM Walkthrough", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+  "item": [
+    {"name": "Register", "request": {"method": "POST", "header": [{"key":"Content-Type","value":"application/json"}], "url": "{{base_url}}/api/user/auth/register/", "body": {"mode":"raw","raw": "{\n  \"email\": \"test@test.com\",\n  \"firstName\": \"John\",\n  \"lastName\": \"Doe\",\n  \"title\": \"Mr.\",\n  \"address\": \"123 Main St\",\n  \"telephone1\": \"555-123-4567\",\n  \"changePassNxtLog\": null,\n  \"lastLoginDate\": \"2024-12-28T12:00:00Z\",\n  \"firstLoginDate\": \"2024-11-28T12:00:00Z\",\n  \"is_active\": true,\n  \"is_admin\": false,\n  \"password\":\"123123\",\n  \"password2\":\"123123\"\n}"}}},
+    {"name": "User Login", "request": {"method": "POST", "header": [{"key":"Content-Type","value":"application/json"}], "url": "{{base_url}}/api/user/auth/login/", "body": {"mode":"raw","raw": "{\n  \"email\":\"test@test.com\",\n  \"password\":\"123123\"\n}"}}},
+    {"name": "Profile", "request": {"method": "GET", "header": [{"key":"Authorization","value":"Bearer {{access_token}}"}], "url": "{{base_url}}/api/user/auth/profile"}},
+    {"name": "Admin Login", "request": {"method": "POST", "header": [{"key":"Content-Type","value":"application/json"}], "url": "{{base_url}}/api/user/auth/login/", "body": {"mode":"raw","raw": "{\n  \"email\":\"a.mahmoud@transtecbds.com\",\n  \"password\":\"Trans@321\"\n}"}}},
+    {"name": "Permission URLs Tree", "request": {"method": "GET", "header": [{"key":"Authorization","value":"Bearer {{admin_access_token}}"}], "url": "{{base_url}}/api/iam/permission/urls/tree?page_size=2&page=1&ordering=-id"}},
+    {"name": "Create Role", "request": {"method": "POST", "header": [{"key":"Content-Type","value":"application/json"},{"key":"Authorization","value":"Bearer {{admin_access_token}}"}], "url": "{{base_url}}/api/iam/role/create", "body": {"mode":"raw","raw": "{\n  \"name\":\"role for test user \",\n  \"permissions\": [\n    { \"name\":\"list all the business\",\n      \"url_pattern\":\"/api/business/list\"\n    },\n    { \"name\":\"list all the roles\",\n      \"url_pattern\":\"/api/iam/role/list\"\n    }\n  ]\n}"}}},
+    {"name": "List Roles", "request": {"method": "GET", "header": [{"key":"Authorization","value":"Bearer {{admin_access_token}}"}], "url": "{{base_url}}/api/iam/role/list?select=name%2Cid&filter=&page_size=2&page=1&ordering=-id"}},
+    {"name": "Assign Role to User (id=5)", "request": {"method": "POST", "header": [{"key":"Content-Type","value":"application/json"},{"key":"Authorization","value":"Bearer {{admin_access_token}}"}], "url": "{{base_url}}/api/iam/role/user/add/5", "body": {"mode":"raw","raw": "{\n  \"role_ids\":[13]\n}"}}},
+    {"name": "User — List Business", "request": {"method": "GET", "header": [{"key":"Authorization","value":"Bearer {{access_token}}"}], "url": "{{base_url}}/api/business/list"}},
+    {"name": "User — Forbidden Permission List", "request": {"method": "GET", "header": [{"key":"Authorization","value":"Bearer {{access_token}}"}], "url": "{{base_url}}/api/iam/permission/list?page_size=2&page=1&ordering=-id"}}
+  ]
 }
 ```
 
-**Common error codes**
-- `invalid_input`, `invalid_credentials`, `invalid_token`, `token_expired`, `token_revoked`, `email_inactive`, `subscription_inactive`, `token_limit_reached`, `forbidden`, `not_found`, `too_many_attempts`, `refresh_disabled`.
-
 ---
 
-## 8) Security & Validation Rules
-
-- **Password policy:** configurable min length (≥8), breach list checks, rate limiting + IP throttling.
-- **Domain enforcement:** login email must end with `@{COMPANY.domain}`.
-- **JWT validation:** RS256 signature, `exp`/`iat`, required `aud`/`iss`, `cid` present, optional `perms` claim.
-- **Revocation checks:** token blacklist table or `revoked=true` flag; cache hinting for hot paths.
-- **Subscription guard:** deny if `now > SUBSCRIPTION.end_date` or `active=false`.
-- **Least privilege:** endpoint declares required permissions; middleware compares with token claims/role.
-- **Audit logging:** success/failure for login, token issue/revoke, permission denials.
-
----
-
-## 9) Sequence Diagrams (Mermaid)
-
-### 9.1 Login & Token Issuance
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant Auth as Auth Service
-    participant Dir as Company Directory
-    participant Sub as Subscription Service
-    participant DB as Token Store
-
-    Client->>Auth: POST /auth/login (email, password, device)
-    Auth->>Dir: Validate email domain & status
-    Dir-->>Auth: Email OK / Active + Company
-    Auth->>Sub: Check subscription active & token_limit
-    Sub-->>Auth: Active + limit OK
-    Auth->>Auth: Verify password (hash)
-    Auth-->>Client: 401 if invalid_credentials
-    Auth->>DB: Create TOKEN (issued_at, expires_at, device)
-    DB-->>Auth: TOKEN.id
-    Auth-->>Client: 201 { access_token (JWT), expires_at, token_id }
-```
-
-### 9.2 Protected Endpoint Access
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant GW as openAPI Gateway
-    participant Auth as Auth Middleware
-    participant Sub as Subscription Service
-
-    Client->>GW: GET /flights (Authorization: Bearer <JWT>)
-    GW->>Auth: Validate signature, exp, iss/aud, cid
-    Auth->>Sub: Ensure subscription active
-    Sub-->>Auth: Active
-    Auth->>Auth: Check token.revoked == false & email.active == true
-    Auth->>Auth: Check role/permissions for endpoint scope
-    Auth-->>GW: allow or 403/401
-    GW-->>Client: 200 data OR error
-```
-
-### 9.3 Token Revocation (Self‑Service)
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant Auth as Auth Service
-    participant DB as Token Store
-
-    Client->>Auth: POST /auth/token/revoke { token_id }
-    Auth->>DB: Set TOKEN.revoked = true
-    DB-->>Auth: OK
-    Auth-->>Client: 200 { msg: "Token revoked." }
-```
-
-### 9.4 Backoffice: Central Token Revoke
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Admin
-    participant BO as Backoffice API
-    participant DB as Token Store
-
-    Admin->>BO: POST /admin/tokens/:id/revoke
-    BO->>DB: Set TOKEN.revoked = true
-    DB-->>BO: OK
-    BO-->>Admin: 200 { msg: "Token revoked." }
-```
-
-### 9.5 Company Email Management
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Admin as Company Admin
-    participant Dir as Company Directory
-
-    Admin->>Dir: POST /companies/:id/emails { email }
-    Dir->>Dir: Validate domain & uniqueness
-    Dir-->>Admin: 201 Created
-    Admin->>Dir: DELETE /companies/:id/emails/:emailId
-    Dir->>Dir: Set active=false (revoke)
-    Dir-->>Admin: 200 Updated
-```
-
----
-
-## 10) Operational Notes
-
-- **Caching:** public key JWKS caching; short TTL cache for `SUBSCRIPTION.active` and `TOKEN.revoked` to reduce DB hits.
-- **Rate limiting:** per‑IP and per‑email on `/auth/login` and `/auth/token`.
-- **Observability:** structured logs (request_id, company_id, email), metrics (issuance count, revocations, denies), traces around middleware.
-- **Key rotation:** support JWKS with `kid`; publish new public keys before rotating private key.
-- **Pagination & Indexes:** indexes on `(company_id)`, `(company_email_id)`, `(revoked, expires_at)`.
-
----
-
-## 11) Acceptance Criteria Mapping
-
-- ✅ **Complete, structured documentation** with overview, interactions, data model, endpoints, errors.
-- ✅ **ERD** shows `COMPANY`, `COMPANY_EMAIL`, `SUBSCRIPTION`, `TOKEN` and relationships.
-- ✅ **Endpoints** include clear purpose, logic, parameters, validation, examples, errors.
-- ✅ **Error handling** standardized with codes and examples.
-- ✅ **Sequence diagrams** for login, protected access, revocation, backoffice, and email management.
-- ✅ **Business rules enforced**: company‑based auth, no refresh tokens, token expiry bound by subscription, role‑permission checks, backoffice controls.
-
----
-
-### Appendix: Conventional Refresh Flow (For Non‑S2S Products)
-> Not used in openAPI S2S; documented for portability.
-
-**POST** `/auth/refresh` (disabled here)
-- Would accept `{ refresh_token }`, validate rotation, issue new access token.
-- In openAPI, returns `405` as above.
+**Done.** This document is ready to copy into your repo or share with stakeholders. If you want this saved as a `.md` file attachment, say “export to md” and I’ll provide the downloadable file.
